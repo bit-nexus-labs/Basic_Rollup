@@ -6239,6 +6239,7 @@ dependencies = [
  "solana-pubkey 4.4.0",
  "solana-rpc-client",
  "solana-signer",
+ "solana-transaction",
 ]
 
 [[package]]
