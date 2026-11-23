@@ -9,10 +9,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use solana_keypair::{read_keypair_file, write_keypair_file, Keypair};
+use solana_pubkey::Pubkey;
+use solana_rpc_client::{api::config::CommitmentConfig, rpc_client::RpcClient};
 use solana_signer::Signer;
 
 const USAGE: &str = "\
@@ -22,6 +24,7 @@ Tasks:
   demo     Create the demo keys and genesis in demo/ and print how to run the rollup
   verify   Format, lint and test the workspace, then run the smoke test
   smoke    Run the real server and client on loopback and check the resulting balances
+  settle   Run the full settlement scenario on a real local validator
   mainnet  Compare the rollup's Mainnet snapshot with the live cluster (needs network)
   live     Pull an account from ROLLUP_TEST_CLUSTER_URL (default devnet; needs network)";
 
@@ -35,6 +38,7 @@ fn main() -> Result<()> {
         Some("demo") => demo(),
         Some("verify") => verify(),
         Some("smoke") => smoke(),
+        Some("settle") => settle(),
         Some("mainnet") => ignored_test("mainnet_snapshot_is_current"),
         Some("live") => ignored_test("live_cluster_account_matches_the_rollup"),
         _ => bail!("{USAGE}"),
@@ -294,4 +298,294 @@ impl Drop for Server {
             let _ = self.0.wait();
         }
     }
+}
+
+fn check_eq<T: std::fmt::Debug + PartialEq>(actual: T, expected: T, desc: &str) -> Result<()> {
+    ensure!(
+        actual == expected,
+        "{desc}: expected {expected:?}, got {actual:?}"
+    );
+    Ok(())
+}
+
+fn settle() -> Result<()> {
+    let settle_dir = target_directory().join("settle");
+    let mut guard = SettleGuard {
+        dir: settle_dir.clone(),
+        validator: None,
+        rollup: None,
+    };
+    if let Err(e) = run_settle(&mut guard) {
+        eprintln!("settle failed: {e:#}");
+        print_log_tail(&settle_dir.join("rollup.log"), "rollup.log");
+        print_log_tail(&settle_dir.join("validator.log"), "validator.log");
+        guard.kill();
+        let _ = fs::remove_dir_all(&settle_dir);
+        std::process::exit(1);
+    }
+    guard.kill();
+    let _ = fs::remove_dir_all(&settle_dir);
+    println!("settle PASSED");
+    Ok(())
+}
+
+fn print_log_tail(path: &Path, name: &str) {
+    if let Ok(c) = fs::read_to_string(path) {
+        let lines: Vec<&str> = c.lines().collect();
+        eprintln!("--- last 30 lines of {name} ---");
+        for line in &lines[lines.len().saturating_sub(30)..] {
+            eprintln!("{line}");
+        }
+    }
+}
+
+struct SettleGuard {
+    dir: PathBuf,
+    validator: Option<Child>,
+    rollup: Option<Child>,
+}
+
+impl SettleGuard {
+    fn kill(&mut self) {
+        for mut c in [self.rollup.take(), self.validator.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for SettleGuard {
+    fn drop(&mut self) {
+        self.kill();
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[rustfmt::skip]
+fn run_settle(guard: &mut SettleGuard) -> Result<()> {
+    ensure!(Command::new("solana-test-validator").arg("--version").output().is_ok(), "solana-test-validator is not on PATH");
+    ensure!(Command::new("cargo-build-sbf").arg("--version").output().is_ok(), "cargo-build-sbf is not on PATH");
+    ensure!(TcpListener::bind("127.0.0.1:8899").is_ok(), "port 8899 is busy");
+    ensure!(TcpListener::bind("127.0.0.1:8080").is_ok(), "port 8080 is busy");
+    println!("ok: environment and tools checked");
+
+    let status = Command::new("cargo-build-sbf").current_dir(workspace_root().join("programs/settlement")).status().context("cargo-build-sbf")?;
+    ensure!(status.success(), "building settlement program failed");
+    cargo(&["build", "--workspace", "--locked"])?;
+    println!("ok: program and workspace built");
+
+    if guard.dir.exists() {
+        fs::remove_dir_all(&guard.dir)?;
+    }
+    fs::create_dir_all(&guard.dir)?;
+
+    let make_key = |name: &str| -> Result<(Keypair, PathBuf)> {
+        let (kp, path) = (Keypair::new(), guard.dir.join(format!("{name}.json")));
+        write_keypair_file(&kp, &path).map_err(|e| anyhow!("{e}"))?;
+        Ok((kp, path))
+    };
+    let (sequencer_key, seq_file) = make_key("sequencer")?;
+    let (wallet_a_key, a_file) = make_key("wallet-a")?;
+    let (wallet_b_key, b_file) = make_key("wallet-b")?;
+    let (fresh_key, fresh_file) = make_key("fresh")?;
+    let (program_key, prog_file) = make_key("program")?;
+    drop(prog_file);
+
+    let (seq_pubkey, a_pubkey, b_pubkey, fresh_pubkey, program_id) = (
+        sequencer_key.pubkey(), wallet_a_key.pubkey(), wallet_b_key.pubkey(),
+        fresh_key.pubkey(), program_key.pubkey(),
+    );
+
+    let val_log = fs::File::create(guard.dir.join("validator.log"))?;
+    let so_path = workspace_root().join("programs/settlement/target/deploy/settlement.so");
+    let validator = Command::new("solana-test-validator")
+        .args(["--reset", "--ledger", guard.dir.join("ledger").to_str().unwrap(), "--upgradeable-program", &program_id.to_string(), so_path.to_str().unwrap(), "none"])
+        .stdout(val_log.try_clone()?)
+        .stderr(val_log)
+        .spawn()
+        .context("starting solana-test-validator")?;
+    guard.validator = Some(validator);
+
+    let rpc = RpcClient::new_with_timeout_and_commitment("http://127.0.0.1:8899", Duration::from_secs(5), CommitmentConfig::confirmed());
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut val_ready = false;
+    while Instant::now() < deadline {
+        if let Some(status) = guard.validator.as_mut().unwrap().try_wait()? {
+            bail!("solana-test-validator exited early with {status}");
+        }
+        if rpc.get_version().is_ok() {
+            val_ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    ensure!(val_ready, "solana-test-validator failed to become ready in 90s");
+    println!("ok: validator started and ready");
+
+    let airdrop = |pk: &Pubkey, lamports: u64| -> Result<()> {
+        rpc.request_airdrop(pk, lamports).context("airdrop request")?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if rpc.get_balance(pk).unwrap_or(0) >= lamports {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        bail!("airdrop to {pk} timed out");
+    };
+    for pk in [&seq_pubkey, &a_pubkey, &b_pubkey] {
+        airdrop(pk, 5_000_000_000)?;
+    }
+
+    let binaries = target_directory().join("debug");
+    let client_bin = binaries.join("rollup_client");
+    let run_client = |args: &[&str]| -> Result<String> {
+        let output = Command::new(&client_bin).args(args).output().with_context(|| format!("running rollup_client {}", args.join(" ")))?;
+        ensure!(output.status.success(), "rollup_client {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr));
+        Ok(String::from_utf8(output.stdout)?)
+    };
+
+    let prog_str = program_id.to_string();
+    for (cmd, file, amt) in [("initialize", &seq_file, ""), ("deposit", &a_file, "2000000000"), ("deposit", &b_file, "1000000000")] {
+        let mut args = vec![cmd, file.to_str().unwrap(), &prog_str];
+        if !amt.is_empty() {
+            args.push(amt);
+        }
+        args.push("http://127.0.0.1:8899");
+        run_client(&args)?;
+    }
+    println!("ok: airdrops and initialization completed");
+
+    let rollup_log = fs::File::create(guard.dir.join("rollup.log"))?;
+    let rollup = Command::new(binaries.join("rollup_core"))
+        .env("ROLLUP_CLUSTER_URL", "http://127.0.0.1:8899")
+        .env("ROLLUP_SETTLEMENT_PROGRAM", program_id.to_string())
+        .env("ROLLUP_SEQUENCER_KEYPAIR", &seq_file)
+        .env("ROLLUP_BIND", "127.0.0.1:8080")
+        .stdout(rollup_log.try_clone()?)
+        .stderr(rollup_log)
+        .spawn()
+        .context("starting rollup_core")?;
+    guard.rollup = Some(rollup);
+
+    let http = Client::builder().timeout(Duration::from_secs(5)).build()?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut rollup_ready = false;
+    while Instant::now() < deadline {
+        if let Some(status) = guard.rollup.as_mut().unwrap().try_wait()? {
+            bail!("rollup_core exited early with {status}");
+        }
+        if let Ok(res) = http.get("http://127.0.0.1:8080/").send() {
+            if res.status().is_success() && res.json::<Value>()?["settlement"] == "configured" {
+                rollup_ready = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    ensure!(rollup_ready, "rollup_core failed to become ready in 30s");
+    println!("ok: rollup started in settlement mode");
+
+    let rollup_balance = |pk: &Pubkey| -> Result<Option<u64>> {
+        let res = http.get(format!("http://127.0.0.1:8080/get_account/{pk}")).send()?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(res.error_for_status()?.json::<Value>()?["lamports"].as_u64())
+    };
+
+    check_eq(rollup_balance(&a_pubkey)?, Some(2_000_000_000), "initial rollup balance A")?;
+    check_eq(rollup_balance(&b_pubkey)?, Some(1_000_000_000), "initial rollup balance B")?;
+
+    let vault_pda = settlement_client::vault_address(&program_id);
+    let rent_min_0 = rpc.get_minimum_balance_for_rent_exemption(0)?;
+    check_eq(rpc.get_balance(&vault_pda)?, rent_min_0 + 3_000_000_000, "initial cluster vault balance")?;
+
+    let config_pda = settlement_client::config_address(&program_id);
+    let config_acc = rpc.get_account(&config_pda)?;
+    let (_, total_committed) = settlement_client::parse_config(&config_acc.data).context("parsing config")?;
+    check_eq(total_committed, 3_000_000_000, "initial total_committed")?;
+    println!("ok: initial balances verified");
+
+    run_client(&[a_file.to_str().unwrap(), &b_pubkey.to_string(), "500000000", "http://127.0.0.1:8080"])?;
+    check_eq(rollup_balance(&a_pubkey)?, Some(1_499_995_000), "balance A after transfer")?;
+    check_eq(rollup_balance(&b_pubkey)?, Some(1_500_000_000), "balance B after transfer")?;
+    println!("ok: transfer A to B verified");
+
+    let check_refusal = |args: &[&str], desc: &str| -> Result<()> {
+        let out = Command::new(&client_bin).args(args).output()?;
+        ensure!(!out.status.success(), "{desc} must fail");
+        let err = String::from_utf8_lossy(&out.stderr);
+        ensure!(err.contains("has not committed lamports to settlement"), "{desc}: {err}");
+        Ok(())
+    };
+    check_refusal(&[a_file.to_str().unwrap(), &fresh_pubkey.to_string(), "100000000", "http://127.0.0.1:8080"], "fresh recipient")?;
+    check_eq(rollup_balance(&a_pubkey)?, Some(1_499_995_000), "A balance unchanged after unfunded transfer refusal")?;
+    check_refusal(&[fresh_file.to_str().unwrap(), &b_pubkey.to_string(), "100000000", "http://127.0.0.1:8080"], "uncommitted sender")?;
+
+    let check_leave_status = |wallet: &Pubkey, bh: &str, sig: &str, expected: u16, desc: &str| -> Result<()> {
+        let res = http.post("http://127.0.0.1:8080/leave")
+            .json(&json!({"wallet": wallet.to_string(), "blockhash": bh, "signature": sig})).send()?;
+        check_eq(res.status().as_u16(), expected, desc)
+    };
+
+    let bh_val: Value = http.get("http://127.0.0.1:8080/get_latest_blockhash").send()?.json()?;
+    let blockhash = bh_val["blockhash"].as_str().context("missing blockhash")?;
+    let bad_sig = wallet_a_key.sign_message(&settlement_client::leave_request_message(&b_pubkey, blockhash));
+    check_leave_status(&b_pubkey, blockhash, &bad_sig.to_string(), 400, "leave with mismatched signature must be 400")?;
+
+    let fake_bh = solana_hash::Hash::new_unique().to_string();
+    let fake_sig = wallet_b_key.sign_message(&settlement_client::leave_request_message(&b_pubkey, &fake_bh));
+    check_leave_status(&b_pubkey, &fake_bh, &fake_sig.to_string(), 400, "leave with unknown blockhash must be 400")?;
+    println!("ok: refusals verified");
+
+    let ledger_b_pda = settlement_client::ledger_address(&program_id, &b_pubkey);
+    let ledger_rent = rpc.get_minimum_balance_for_rent_exemption(40)?;
+    let ledger_b_acc = rpc.get_account(&ledger_b_pda)?;
+    check_eq(ledger_b_acc.lamports, ledger_rent, "ledger B balance before leave")?;
+    let b_cluster_before = rpc.get_balance(&b_pubkey)?;
+    let vault_before_b = rpc.get_balance(&vault_pda)?;
+
+    let bh_val: Value = http.get("http://127.0.0.1:8080/get_latest_blockhash").send()?.json()?;
+    let bh_b = bh_val["blockhash"].as_str().context("missing blockhash")?;
+    let sig_b = wallet_b_key.sign_message(&settlement_client::leave_request_message(&b_pubkey, bh_b));
+    let leave_b_body = json!({"wallet": b_pubkey.to_string(), "blockhash": bh_b, "signature": sig_b.to_string()});
+
+    let res = http.post("http://127.0.0.1:8080/leave").json(&leave_b_body).send()?;
+    check_eq(res.status().as_u16(), 200, "leave B status")?;
+    let receipt_b: Value = res.json()?;
+    check_eq(receipt_b["lamports"].as_u64(), Some(1_500_000_000), "leave B lamports")?;
+
+    let b_cluster_after = rpc.get_balance(&b_pubkey)?;
+    check_eq(b_cluster_after, b_cluster_before + 1_500_000_000 + ledger_rent, "cluster balance B after leave")?;
+
+    let vault_after_b = rpc.get_balance(&vault_pda)?;
+    check_eq(vault_after_b, vault_before_b - 1_500_000_000, "vault balance after B leave")?;
+
+    ensure!(rpc.get_account(&ledger_b_pda).is_err(), "ledger B must be gone");
+    check_eq(rollup_balance(&b_pubkey)?, None, "rollup balance B must be 404")?;
+
+    let bh2_val: Value = http.get("http://127.0.0.1:8080/get_latest_blockhash").send()?.json()?;
+    let bh2 = bh2_val["blockhash"].as_str().context("missing blockhash")?;
+    let sig2 = wallet_b_key.sign_message(&settlement_client::leave_request_message(&b_pubkey, bh2));
+    check_leave_status(&b_pubkey, bh2, &sig2.to_string(), 404, "second leave B must be 404")?;
+    check_leave_status(&b_pubkey, bh_b, &sig_b.to_string(), 409, "replaying leave B must be 409")?;
+    println!("ok: wallet B leave verified");
+
+    let out = run_client(&["leave", a_file.to_str().unwrap(), "http://127.0.0.1:8080"])?;
+    let receipt_a: Value = serde_json::from_str(&out)?;
+    check_eq(receipt_a["lamports"].as_u64(), Some(1_499_995_000), "leave A lamports")?;
+
+    let vault_final = rpc.get_balance(&vault_pda)?;
+    check_eq(vault_final, rent_min_0 + 5_000, "vault balance after A leave")?;
+
+    let config_acc_final = rpc.get_account(&config_pda)?;
+    let (_, total_committed_final) = settlement_client::parse_config(&config_acc_final.data).context("parsing config")?;
+    check_eq(total_committed_final, 5_000, "total_committed after A leave")?;
+    println!("ok: wallet A leave verified");
+
+    Ok(())
 }

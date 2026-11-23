@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use anyhow::{anyhow, ensure, Context, Result};
 use serde::Serialize;
@@ -32,7 +32,11 @@ impl Settlement {
                 keypair_path.display()
             )
         })?;
-        let cluster = RpcClient::new_with_commitment(cluster_url, CommitmentConfig::confirmed());
+        let cluster = RpcClient::new_with_timeout_and_commitment(
+            cluster_url,
+            Duration::from_secs(30),
+            CommitmentConfig::confirmed(),
+        );
 
         let config_addr = settlement_client::config_address(&program);
         let config_account = cluster
@@ -90,7 +94,9 @@ impl Settlement {
 
     pub fn deposit_of(&self, wallet: &Pubkey) -> Result<Option<u64>> {
         let mut deposits = self.deposits_of(std::slice::from_ref(wallet))?;
-        Ok(deposits.pop().unwrap())
+        deposits
+            .pop()
+            .ok_or_else(|| anyhow!("missing deposit result for {wallet}"))
     }
 
     pub fn leave(&self, wallet: &Pubkey, amount: u64) -> Result<Signature> {
