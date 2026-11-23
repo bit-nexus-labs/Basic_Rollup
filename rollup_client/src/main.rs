@@ -30,7 +30,8 @@ const TRANSFER_CONFIG: TransactionConfig = TransactionConfig::empty()
 const USAGE: &str = "\
 Usage: rollup_client <keypair.json> <recipient-pubkey> <lamports> [rollup-url]
        rollup_client initialize <sequencer-keypair.json> <program-id> [cluster-url]
-       rollup_client deposit <wallet-keypair.json> <program-id> <lamports> [cluster-url]";
+       rollup_client deposit <wallet-keypair.json> <program-id> <lamports> [cluster-url]
+       rollup_client leave <wallet-keypair.json> [rollup-url]";
 
 #[derive(Serialize)]
 struct RollupTransaction {
@@ -77,6 +78,19 @@ async fn main() -> Result<()> {
             let instruction = deposit_instruction(&program_id, &payer.pubkey(), lamports);
             send_settlement_transaction(payer, instruction, cluster_url).await
         }
+        Some("leave") => {
+            if !(2..=3).contains(&arguments.len()) {
+                bail!("{USAGE}");
+            }
+            let wallet = keypair::read_keypair_file(&arguments[1])
+                .map_err(|error| anyhow!("failed to read keypair {}: {error}", arguments[1]))?;
+            let rollup_url = arguments
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or("http://127.0.0.1:8080")
+                .trim_end_matches('/');
+            run_leave(wallet, rollup_url).await
+        }
         _ => {
             if !(3..=4).contains(&arguments.len()) {
                 bail!("{USAGE}");
@@ -108,6 +122,38 @@ async fn send_settlement_transaction(
     .context("join blocking settlement task")??;
 
     println!("{signature}");
+    Ok(())
+}
+
+async fn run_leave(wallet: keypair::Keypair, rollup_url: &str) -> Result<()> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("create HTTP client")?;
+    let response = client
+        .get(format!("{rollup_url}/get_latest_blockhash"))
+        .send()
+        .await
+        .context("request rollup blockhash")?;
+    let latest_blockhash = read_response(response).await?;
+    let blockhash = latest_blockhash["blockhash"]
+        .as_str()
+        .context("rollup response is missing blockhash")?;
+    let message_bytes = settlement_client::leave_request_message(&wallet.pubkey(), blockhash);
+    let signature = wallet.sign_message(&message_bytes);
+    let request = json!({
+        "wallet": wallet.pubkey().to_string(),
+        "blockhash": blockhash,
+        "signature": signature.to_string(),
+    });
+    let response = client
+        .post(format!("{rollup_url}/leave"))
+        .json(&request)
+        .send()
+        .await
+        .context("submit leave request")?;
+    let receipt = read_response(response).await?;
+    println!("{}", serde_json::to_string_pretty(&receipt)?);
     Ok(())
 }
 

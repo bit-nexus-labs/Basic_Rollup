@@ -1,6 +1,7 @@
 use std::{
     collections::{HashSet, VecDeque},
     slice,
+    str::FromStr,
     sync::{Arc, RwLock},
 };
 
@@ -49,7 +50,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     rollupdb::{AccountBalance, ExecutionStatus, RollupDB, TransactionReceipt},
-    settle::SettlementStatus,
+    settle::{Settlement, SettlementStatus},
 };
 
 // Solana Mainnet parameters (Solana 1.0, Agave 4.4.1). Limits that a crate exports
@@ -109,6 +110,22 @@ const MAINNET_INACTIVE_FEATURES: [Pubkey; 37] = [
 /// A transaction that passed the validator's sanitization and signature checks.
 type ValidTransaction = RuntimeTransaction<SanitizedTransaction>;
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct LeaveReceipt {
+    pub wallet: String,
+    pub lamports: u64,
+    pub cluster_signature: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum LeaveError {
+    Invalid(String),
+    NotCommitted,
+    AlreadyUsed,
+    NotConfigured,
+    ClusterUnavailable(String),
+}
+
 pub(crate) enum SequencerMessage {
     Blockhash {
         reply: oneshot::Sender<Hash>,
@@ -126,6 +143,12 @@ pub(crate) enum SequencerMessage {
         address: Pubkey,
         /// `Err` carries the reason the cluster could not be asked for the account.
         reply: oneshot::Sender<Result<Option<AccountBalance>, String>>,
+    },
+    Leave {
+        wallet: Pubkey,
+        blockhash: String,
+        signature: Signature,
+        reply: oneshot::Sender<Result<LeaveReceipt, LeaveError>>,
     },
 }
 
@@ -184,6 +207,8 @@ pub(crate) struct Sequencer {
     environment: TransactionProcessingEnvironment,
     // The SVM program cache holds only a Weak reference to this graph.
     _fork_graph: Arc<RwLock<RollupForkGraph>>,
+    settlement: Option<Settlement>,
+    used_leaves: HashSet<Signature>,
 }
 
 impl Sequencer {
@@ -204,7 +229,7 @@ impl Sequencer {
     // https://github.com/anza-xyz/agave/blob/v4.4.1/syscalls/src/lib.rs#L314
     // Agave: `Bank::do_load_and_execute_transactions` builds the environment per batch
     // https://github.com/anza-xyz/agave/blob/v4.4.1/runtime/src/bank.rs#L4276
-    pub fn new(db: RollupDB) -> Result<Self> {
+    pub fn new(db: RollupDB, settlement: Option<Settlement>) -> Result<Self> {
         let mut feature_set = FeatureSet::all_enabled();
         for feature_id in &MAINNET_INACTIVE_FEATURES {
             feature_set.deactivate(feature_id);
@@ -246,6 +271,8 @@ impl Sequencer {
             processor,
             environment,
             _fork_graph: fork_graph,
+            settlement,
+            used_leaves: HashSet::new(),
         })
     }
 
@@ -306,11 +333,37 @@ impl Sequencer {
                     let _ = reply.send(self.db.transaction(&signature));
                 }
                 SequencerMessage::Balance { address, reply } => {
-                    let balance = match self.db.pull([&address]) {
-                        Ok(()) => Ok(self.db.balance(&address)),
-                        Err(error) => Err(format!("{error:#}")),
+                    let balance = if let Some(settlement) = &self.settlement {
+                        if self.db.is_committed(&address) {
+                            Ok(self.db.balance(&address))
+                        } else if !self.db.is_resolved(&address) {
+                            match settlement.deposit_of(&address) {
+                                Ok(Some(lamports)) => {
+                                    self.db.admit(address, lamports);
+                                    Ok(self.db.balance(&address))
+                                }
+                                Ok(None) => Ok(None),
+                                Err(error) => Err(format!("{error:#}")),
+                            }
+                        } else {
+                            Ok(None)
+                        }
+                    } else {
+                        match self.db.pull([&address]) {
+                            Ok(()) => Ok(self.db.balance(&address)),
+                            Err(error) => Err(format!("{error:#}")),
+                        }
                     };
                     let _ = reply.send(balance);
+                }
+                SequencerMessage::Leave {
+                    wallet,
+                    blockhash,
+                    signature,
+                    reply,
+                } => {
+                    let result = self.leave(wallet, blockhash, signature);
+                    let _ = reply.send(result);
                 }
             }
         }
@@ -329,6 +382,61 @@ impl Sequencer {
         self.recent_blockhashes.push_back(blockhash);
 
         blockhash
+    }
+
+    fn leave(
+        &mut self,
+        wallet: Pubkey,
+        blockhash: String,
+        signature: Signature,
+    ) -> Result<LeaveReceipt, LeaveError> {
+        let Some(settlement) = &self.settlement else {
+            return Err(LeaveError::NotConfigured);
+        };
+        let parsed_blockhash = Hash::from_str(&blockhash)
+            .map_err(|_| LeaveError::Invalid("invalid blockhash".into()))?;
+        if !self.recent_blockhashes.contains(&parsed_blockhash) {
+            return Err(LeaveError::Invalid(
+                "blockhash is not a recent hash issued by this rollup".into(),
+            ));
+        }
+        let message = settlement_client::leave_request_message(&wallet, &blockhash);
+        if !signature.verify(wallet.as_ref(), &message) {
+            return Err(LeaveError::Invalid("signature verification failed".into()));
+        }
+        if self.used_leaves.contains(&signature) {
+            return Err(LeaveError::AlreadyUsed);
+        }
+        if !self.db.is_committed(&wallet) {
+            return Err(LeaveError::NotCommitted);
+        }
+        let amount = self.db.lamports(&wallet);
+        // Freezing: the single sequencer thread serializes this leave so no other transaction can
+        // modify the wallet while the cluster confirms.
+        match settlement.leave(&wallet, amount) {
+            Ok(cluster_sig) => {
+                self.db.forget(&wallet);
+                self.used_leaves.insert(signature);
+                Ok(LeaveReceipt {
+                    wallet: wallet.to_string(),
+                    lamports: amount,
+                    cluster_signature: cluster_sig.to_string(),
+                })
+            }
+            Err(e) => match settlement.deposit_of(&wallet) {
+                Ok(None) => {
+                    log::info!("leave failed but ledger is gone; cluster already paid: {e:#}");
+                    self.db.forget(&wallet);
+                    self.used_leaves.insert(signature);
+                    Ok(LeaveReceipt {
+                        wallet: wallet.to_string(),
+                        lamports: amount,
+                        cluster_signature: String::new(),
+                    })
+                }
+                _ => Err(LeaveError::ClusterUnavailable(format!("{e:#}"))),
+            },
+        }
     }
 
     // A validator spreads these stages over threads. Phases 1, 2 and 4 run in the
@@ -468,9 +576,36 @@ impl Sequencer {
         &mut self,
         addresses: impl IntoIterator<Item = &'a Pubkey>,
     ) -> Result<(), SubmissionError> {
-        self.db
-            .pull(addresses)
-            .map_err(|error| SubmissionError::ClusterUnavailable(format!("{error:#}")))
+        if let Some(settlement) = &self.settlement {
+            let unresolved: Vec<Pubkey> = addresses
+                .into_iter()
+                .filter(|addr| !self.db.is_resolved(addr))
+                .copied()
+                .collect();
+            if unresolved.is_empty() {
+                return Ok(());
+            }
+            let deposits = settlement
+                .deposits_of(&unresolved)
+                .map_err(|e| SubmissionError::ClusterUnavailable(format!("{e:#}")))?;
+            for (addr, dep) in unresolved.iter().zip(&deposits) {
+                if dep.is_none() {
+                    return Err(SubmissionError::Invalid(format!(
+                        "account {addr} has not committed lamports to settlement"
+                    )));
+                }
+            }
+            for (addr, dep) in unresolved.into_iter().zip(deposits) {
+                if let Some(lamports) = dep {
+                    self.db.admit(addr, lamports);
+                }
+            }
+            Ok(())
+        } else {
+            self.db
+                .pull(addresses)
+                .map_err(|error| SubmissionError::ClusterUnavailable(format!("{error:#}")))
+        }
     }
 
     // Phase 4, budget: compute limits and the fee, derived as a validator derives them.
@@ -616,7 +751,11 @@ impl Sequencer {
             error: outcome.as_ref().err().map(ToString::to_string),
             fee: processed.fee_details().total_fee(),
             compute_units_consumed: processed.executed_units(),
-            settlement: SettlementStatus::NotConfigured,
+            settlement: if self.settlement.is_some() {
+                SettlementStatus::Pending
+            } else {
+                SettlementStatus::NotConfigured
+            },
             sol_transaction: BASE64_STANDARD.encode(wire_transaction),
         };
 

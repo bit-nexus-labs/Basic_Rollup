@@ -74,6 +74,7 @@ pub(crate) struct RollupDB {
     /// Addresses the rollup has taken ownership of. They are never pulled again, so a
     /// cluster balance cannot come back after the rollup spent or removed it.
     resolved: HashSet<Pubkey>,
+    committed: HashSet<Pubkey>,
 }
 
 impl RollupDB {
@@ -88,6 +89,7 @@ impl RollupDB {
             transactions: HashMap::new(),
             cluster: cluster_url.map(|url| RpcClient::new_with_timeout(url, CLUSTER_TIMEOUT)),
             resolved: HashSet::from([system_program::id()]),
+            committed: HashSet::new(),
         }
     }
 
@@ -124,6 +126,34 @@ impl RollupDB {
         }
 
         Ok(())
+    }
+
+    pub fn is_resolved(&self, address: &Pubkey) -> bool {
+        self.resolved.contains(address)
+    }
+
+    pub fn admit(&mut self, wallet: Pubkey, lamports: u64) {
+        let data = AccountSharedData::empty(lamports, &system_program::id());
+        self.accounts.insert(wallet, data);
+        self.resolved.insert(wallet);
+        self.committed.insert(wallet);
+    }
+
+    pub fn is_committed(&self, wallet: &Pubkey) -> bool {
+        self.committed.contains(wallet)
+    }
+
+    pub fn forget(&mut self, wallet: &Pubkey) {
+        self.accounts.remove(wallet);
+        self.resolved.remove(wallet);
+        self.committed.remove(wallet);
+    }
+
+    pub fn lamports(&self, wallet: &Pubkey) -> u64 {
+        self.accounts
+            .get(wallet)
+            .map(|account| account.lamports())
+            .unwrap_or(0)
     }
 
     /// Copies the accounts the rollup has not seen yet from the cluster, as they are at
@@ -201,3 +231,43 @@ impl TransactionProcessingCallback for RollupDB {
 }
 
 impl InvokeContextCallback for RollupDB {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_admit_commit_forget() {
+        let mut db = RollupDB::new(None);
+        let wallet = Pubkey::new_unique();
+        assert!(!db.is_committed(&wallet));
+        assert_eq!(db.lamports(&wallet), 0);
+
+        db.admit(wallet, 1_000);
+        assert!(db.is_committed(&wallet));
+        assert_eq!(db.lamports(&wallet), 1_000);
+        assert_eq!(db.balance(&wallet).unwrap().lamports, 1_000);
+
+        // Commit with 0 lamports leaves account empty, but still committed.
+        let receipt = TransactionReceipt {
+            signature: Signature::default().to_string(),
+            version: TransactionVersion::LEGACY,
+            status: ExecutionStatus::Executed,
+            error: None,
+            fee: 5000,
+            compute_units_consumed: 150,
+            settlement: SettlementStatus::NotConfigured,
+            sol_transaction: String::new(),
+        };
+        let empty = AccountSharedData::empty(0, &system_program::id());
+        db.commit(Signature::default(), receipt, [(wallet, empty)]);
+        assert!(db.is_committed(&wallet));
+        assert_eq!(db.lamports(&wallet), 0);
+        assert!(db.balance(&wallet).is_none());
+
+        db.forget(&wallet);
+        assert!(!db.is_committed(&wallet));
+        assert_eq!(db.lamports(&wallet), 0);
+        assert!(!db.is_resolved(&wallet));
+    }
+}

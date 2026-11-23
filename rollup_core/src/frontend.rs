@@ -8,10 +8,11 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::sequencer::{SequencerMessage, SubmissionError};
+use crate::sequencer::{LeaveError, SequencerMessage, SubmissionError};
 
 pub(crate) struct Frontend {
     pub sequencer: mpsc::Sender<SequencerMessage>,
+    pub settlement_configured: bool,
 }
 
 #[derive(Deserialize)]
@@ -24,6 +25,13 @@ pub(crate) struct RollupTransaction {
     // Base64 of the serialized transaction, the form Solana's `sendTransaction` takes.
     // The legacy `sender` label is accepted as extra JSON, never used as authentication.
     sol_transaction: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct LeaveRequest {
+    wallet: String,
+    blockhash: String,
+    signature: String,
 }
 
 pub(crate) async fn submit_transaction(
@@ -126,8 +134,58 @@ pub(crate) async fn get_latest_blockhash(
     Ok(HttpResponse::Ok().json(json!({"blockhash": blockhash.to_string()})))
 }
 
-pub(crate) async fn health() -> HttpResponse {
-    HttpResponse::Ok().json(
-        json!({"status": "ok", "application": "sol_transfer", "settlement": "not_configured"}),
-    )
+pub(crate) async fn leave(
+    body: web::Json<LeaveRequest>,
+    frontend: web::Data<Frontend>,
+) -> actix_web::Result<HttpResponse> {
+    let Ok(wallet) = Pubkey::from_str(&body.wallet) else {
+        return Ok(HttpResponse::BadRequest().json(json!({"error": "invalid wallet address"})));
+    };
+    let Ok(signature) = Signature::from_str(&body.signature) else {
+        return Ok(HttpResponse::BadRequest().json(json!({"error": "invalid signature"})));
+    };
+    let (reply, response) = oneshot::channel();
+    frontend
+        .sequencer
+        .send(SequencerMessage::Leave {
+            wallet,
+            blockhash: body.blockhash.clone(),
+            signature,
+            reply,
+        })
+        .await
+        .map_err(|_| error::ErrorServiceUnavailable("sequencer unavailable"))?;
+    match response
+        .await
+        .map_err(|_| error::ErrorServiceUnavailable("sequencer stopped"))?
+    {
+        Ok(receipt) => Ok(HttpResponse::Ok().json(receipt)),
+        Err(LeaveError::Invalid(reason)) => {
+            Ok(HttpResponse::BadRequest().json(json!({"error": reason})))
+        }
+        Err(LeaveError::NotCommitted) => {
+            Ok(HttpResponse::NotFound().json(json!({"error": "account not committed"})))
+        }
+        Err(LeaveError::AlreadyUsed) => {
+            Ok(HttpResponse::Conflict().json(json!({"error": "signature already used"})))
+        }
+        Err(LeaveError::NotConfigured) => {
+            Ok(HttpResponse::NotImplemented().json(json!({"error": "settlement not configured"})))
+        }
+        Err(LeaveError::ClusterUnavailable(reason)) => {
+            Ok(HttpResponse::ServiceUnavailable().json(json!({"error": reason})))
+        }
+    }
+}
+
+pub(crate) async fn health(frontend: web::Data<Frontend>) -> HttpResponse {
+    HttpResponse::Ok().json(json!({
+        "status": "ok",
+        "application": "sol_transfer",
+        "settlement": if frontend.settlement_configured {
+            "configured"
+        } else {
+            "not_configured"
+        }
+    }))
 }

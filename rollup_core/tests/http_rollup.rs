@@ -765,3 +765,27 @@ fn live_cluster_account_matches_the_rollup() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn unconfigured_settlement_refuses_leave() -> Result<()> {
+    let rollup = Rollup::start("settle_unconf")?;
+    let health: Value = rollup
+        .client
+        .get(&rollup.url)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(health["settlement"], "not_configured");
+
+    let response = rollup
+        .client
+        .post(format!("{}/leave", rollup.url))
+        .json(&json!({
+            "wallet": Keypair::new().pubkey().to_string(),
+            "blockhash": Hash::default().to_string(),
+            "signature": solana_signature::Signature::default().to_string(),
+        }))
+        .send()?;
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    Ok(())
+}

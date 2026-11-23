@@ -3097,6 +3097,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "settlement_client",
  "solana-account",
  "solana-bincode",
  "solana-clock",
