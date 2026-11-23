@@ -11,10 +11,14 @@ base64.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+settlement_client = { path = "../settlement_client" }
 solana-hash.workspace = true
+solana-instruction.workspace = true
 solana-keypair.workspace = true
 solana-message.workspace = true
 solana-pubkey.workspace = true
+solana-rpc-client = { version = "=4.4.1", default-features = false }
+solana-signature.workspace = true
 solana-signer.workspace = true
 solana-system-interface.workspace = true
 solana-transaction.workspace = true

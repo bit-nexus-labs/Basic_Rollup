@@ -5,16 +5,20 @@ use base64::{prelude::BASE64_STANDARD, Engine};
 use reqwest::{Client, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
+use settlement_client::{deposit_instruction, initialize_instruction};
 use solana_hash::Hash;
+use solana_instruction::Instruction;
 use solana_keypair as keypair;
 use solana_message::{
     v1::{Message, TransactionConfig},
     VersionedMessage,
 };
 use solana_pubkey::Pubkey;
+use solana_rpc_client::{api::config::CommitmentConfig, rpc_client::RpcClient};
+use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_system_interface::instruction as system_instruction;
-use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction::{versioned::VersionedTransaction, Transaction};
 
 /// A v1 transaction states its own limits; anything left unset is zero, not a default.
 /// The System program charges 150 compute units for a transfer, and one 32 KiB page
@@ -22,6 +26,11 @@ use solana_transaction::versioned::VersionedTransaction;
 const TRANSFER_CONFIG: TransactionConfig = TransactionConfig::empty()
     .with_compute_unit_limit(150)
     .with_loaded_accounts_data_size_limit(32 * 1024);
+
+const USAGE: &str = "\
+Usage: rollup_client <keypair.json> <recipient-pubkey> <lamports> [rollup-url]
+       rollup_client initialize <sequencer-keypair.json> <program-id> [cluster-url]
+       rollup_client deposit <wallet-keypair.json> <program-id> <lamports> [cluster-url]";
 
 #[derive(Serialize)]
 struct RollupTransaction {
@@ -33,9 +42,76 @@ struct RollupTransaction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let arguments: Vec<String> = env::args().skip(1).collect();
-    if !(3..=4).contains(&arguments.len()) {
-        bail!("Usage: rollup_client <keypair.json> <recipient-pubkey> <lamports> [rollup-url]");
+
+    match arguments.first().map(String::as_str) {
+        Some("initialize") => {
+            if !(3..=4).contains(&arguments.len()) {
+                bail!("{USAGE}");
+            }
+            let payer = keypair::read_keypair_file(&arguments[1])
+                .map_err(|error| anyhow!("failed to read keypair {}: {error}", arguments[1]))?;
+            let program_id: Pubkey = arguments[2].parse().context("invalid program id")?;
+            let cluster_url = arguments
+                .get(3)
+                .map(String::as_str)
+                .unwrap_or("http://127.0.0.1:8899")
+                .to_string();
+            let instruction = initialize_instruction(&program_id, &payer.pubkey(), &payer.pubkey());
+            send_settlement_transaction(payer, instruction, cluster_url).await
+        }
+        Some("deposit") => {
+            if !(4..=5).contains(&arguments.len()) {
+                bail!("{USAGE}");
+            }
+            let payer = keypair::read_keypair_file(&arguments[1])
+                .map_err(|error| anyhow!("failed to read keypair {}: {error}", arguments[1]))?;
+            let program_id: Pubkey = arguments[2].parse().context("invalid program id")?;
+            let lamports: u64 = arguments[3]
+                .parse()
+                .context("lamports must be a positive integer")?;
+            let cluster_url = arguments
+                .get(4)
+                .map(String::as_str)
+                .unwrap_or("http://127.0.0.1:8899")
+                .to_string();
+            let instruction = deposit_instruction(&program_id, &payer.pubkey(), lamports);
+            send_settlement_transaction(payer, instruction, cluster_url).await
+        }
+        _ => {
+            if !(3..=4).contains(&arguments.len()) {
+                bail!("{USAGE}");
+            }
+            run_transfer(&arguments).await
+        }
     }
+}
+
+async fn send_settlement_transaction(
+    payer: keypair::Keypair,
+    instruction: Instruction,
+    cluster_url: String,
+) -> Result<()> {
+    let signature = tokio::task::spawn_blocking(move || -> Result<Signature> {
+        let client = RpcClient::new_with_commitment(cluster_url, CommitmentConfig::confirmed());
+        let blockhash = client.get_latest_blockhash().map_err(|e| anyhow!("{e}"))?;
+        let transaction = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&payer.pubkey()),
+            &[&payer],
+            blockhash,
+        );
+        client
+            .send_and_confirm_transaction(&transaction)
+            .map_err(|e| anyhow!("{e}"))
+    })
+    .await
+    .context("join blocking settlement task")??;
+
+    println!("{signature}");
+    Ok(())
+}
+
+async fn run_transfer(arguments: &[String]) -> Result<()> {
     let recipient: Pubkey = arguments[1]
         .parse()
         .context("invalid recipient public key")?;

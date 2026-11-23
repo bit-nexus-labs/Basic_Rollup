@@ -1,5 +1,5 @@
 [workspace]
-members = ["rollup_core", "rollup_client", "xtask"]
+members = ["rollup_core", "rollup_client", "settlement_client", "xtask"]
 exclude = ["programs/settlement"]
 resolver = "2"
 

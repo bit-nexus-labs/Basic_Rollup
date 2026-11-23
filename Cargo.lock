@@ -3068,10 +3068,14 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "settlement_client",
  "solana-hash",
+ "solana-instruction 4.0.0",
  "solana-keypair",
  "solana-message",
  "solana-pubkey 4.4.0",
+ "solana-rpc-client",
+ "solana-signature",
  "solana-signer",
  "solana-system-interface",
  "solana-transaction",
@@ -3364,6 +3368,15 @@ checksum = "66cf8fedced2fcf12406bcb34223dffb92eaf34908ede12fed414c82b7f00b3e"
 dependencies = [
  "base16ct",
  "serde",
+]
+
+[[package]]
+name = "settlement_client"
+version = "0.1.0"
+dependencies = [
+ "solana-instruction 4.0.0",
+ "solana-pubkey 4.4.0",
+ "solana-system-interface",
 ]
 
 [[package]]

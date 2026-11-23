@@ -1,0 +1,11 @@
+[package]
+name = "settlement_client"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98.1"
+authors = ["bergabman bergabman1@gmail.com"]
+
+[dependencies]
+solana-instruction.workspace = true
+solana-pubkey = { workspace = true, features = ["curve25519"] }
+solana-system-interface.workspace = true
