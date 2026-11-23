@@ -1,5 +1,6 @@
 [workspace]
 members = ["rollup_core", "rollup_client", "xtask"]
+exclude = ["programs/settlement"]
 resolver = "2"
 
 [workspace.dependencies]
