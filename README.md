@@ -6,8 +6,8 @@ client signs and submits transfers. No other service is required.
 
 The application is native SOL transfers: it accepts legacy, v0 and v1 transactions
 containing only System `Transfer` instructions. It is not a general
-program-execution platform. Settlement on a Solana cluster is not built: it is the
-[settlement challenge](#settlement-challenge).
+program-execution platform. Settlement on a Solana cluster is optional and described
+in [Settlement](#settlement): without it the rollup runs exactly as before.
 
 ## Requirements
 
@@ -82,8 +82,8 @@ An account is pulled once. From then on the rollup reads and changes only its ow
 copy, so later changes on the cluster are not seen. With a cluster configured,
 `ROLLUP_GENESIS` is optional, and a genesis account takes precedence over the
 cluster's copy. Nothing is written back to the cluster and nothing locks the
-account there: until settlement exists, the same lamports can still be spent on the
-cluster.
+account there: without [settlement](#settlement), the same lamports can still be spent
+on the cluster.
 
 ## Run the tests
 
@@ -175,14 +175,54 @@ with Mainnet and fails when either has changed.
 - No ComputeBudget program. Legacy and v0 transactions run with the default limits;
   v1 states its own.
 - Fees are removed from the paying account without being burned or paid to a leader.
-- No settlement. Receipts report `settlement: "not_configured"`.
+- Settlement is optional. Without it receipts report `settlement: "not_configured"`; with it they report `"pending"`.
 
-## Settlement challenge
+## Settlement
 
-Settlement is left open as an exercise: design and build the on-chain program and
-the rollup code that commit lamports on the cluster and let a wallet leave with its
-rollup balance. The task, the cluster rules to build on and the decisions to make
-are in [docs/settlement-challenge.md](docs/settlement-challenge.md).
+Settlement connects the rollup to a Solana cluster: lamports used in the rollup are
+committed on the cluster, and a wallet leaves with the balance it ended up with. The
+task is in [docs/settlement-challenge.md](docs/settlement-challenge.md); the answers
+to its nine decisions, the comparison with MagicBlock's delegation program and the
+full list of limits are in [docs/settlement-design.md](docs/settlement-design.md).
+
+How it works, in short:
+
+- `programs/settlement/` is a small on-chain program (own workspace, built with
+  `cargo build-sbf`). A wallet **deposits** lamports into a vault account owned by the
+  program; a per-wallet ledger account records the deposit. The wallet's own account is
+  never assigned, so it keeps paying its fees.
+- With `ROLLUP_SETTLEMENT_PROGRAM` (program id) and `ROLLUP_SEQUENCER_KEYPAIR` (path to
+  the sequencer's keypair file) set, the rollup starts in settlement mode. Both are
+  needed, `ROLLUP_CLUSTER_URL` is required and `ROLLUP_GENESIS` must not be set. The
+  rollup starts a wallet with its deposit and refuses, without a fee, any
+  transaction that touches an address that has not deposited.
+- A wallet **leaves** with `POST /leave`. The sequencer sends one cluster transaction in
+  which the program pays out the wallet's final rollup balance, and only after the
+  cluster confirms does the rollup forget the wallet.
+
+```sh
+# program id and sequencer: use your own keys; the cluster here is a local validator
+cargo build-sbf --manifest-path programs/settlement/Cargo.toml
+cargo run -q -p rollup_client -- initialize sequencer.json <PROGRAM_ID>
+cargo run -q -p rollup_client -- deposit wallet.json <PROGRAM_ID> 1000000000
+ROLLUP_CLUSTER_URL=http://127.0.0.1:8899 ROLLUP_SETTLEMENT_PROGRAM=<PROGRAM_ID> \
+  ROLLUP_SEQUENCER_KEYPAIR=sequencer.json cargo run -p rollup_core --locked
+cargo run -q -p rollup_client -- wallet.json <RECIPIENT> 500000000   # inside the rollup
+cargo run -q -p rollup_client -- leave wallet.json                   # back to the cluster
+```
+
+`cargo xtask settle` runs the whole flow on a local validator (it needs
+`solana-test-validator` and `cargo-build-sbf`, so `cargo xtask verify` does not run it):
+two wallets deposit, one pays the other, the receiver leaves first, the payer later,
+with owners and exact lamports checked after every step, and with the refusals the
+design relies on.
+
+Limits, briefly (the full list is in [docs/settlement-design.md](docs/settlement-design.md)):
+the sequencer is trusted and there are no proofs; the first `initialize` decides who
+the sequencer is; rollup fees stay in the vault and cannot be claimed; rollup state is in
+memory, so after a restart balances are rebuilt from the deposits and transfers made
+inside the rollup are lost; one deposit per wallet until it leaves; the rollup waits
+while a `leave` is confirmed on the cluster.
 
 ## HTTP API
 
@@ -193,6 +233,7 @@ are in [docs/settlement-challenge.md](docs/settlement-challenge.md).
 | `GET /get_account/{address}` | Base58 public key | `address`, `lamports` (pulled from the cluster if unseen) |
 | `POST /submit_transaction` | `{"sol_transaction": "<base64 serialized transaction>"}` | Execution receipt |
 | `POST /get_transaction` | `{"get_tx": "<transaction signature>"}` | Stored execution receipt |
+| `POST /leave` | `{"wallet": "<address>", "blockhash": "<rollup blockhash>", "signature": "<base58>"}` | `wallet`, `lamports` paid, `cluster_signature` (settlement mode only) |
 
 `sol_transaction` is the base64 of the serialized transaction, the same bytes
 Solana's `sendTransaction` takes. Receipts are looked up by the first transaction
@@ -210,6 +251,11 @@ A receipt contains `signature`, `version` (`"legacy"`, `0` or `1`), `status`
 | 409 | Replayed transaction |
 | 422 | The fee payer cannot cover the fee |
 | 503 | The cluster did not answer |
+
+`POST /leave` answers 200, 400 (bad input, bad signature or unknown blockhash), 404
+(wallet not committed), 409 (signature already used), 501 (settlement not configured)
+or 503 (cluster problem). The wallet signs `rollup-leave:<wallet>:<blockhash>` with
+its key; `rollup_client leave` does it.
 
 Only a 200 charges a fee: 5000 lamports per signature plus any v1 priority fee. An
 account left with no lamports is removed.
