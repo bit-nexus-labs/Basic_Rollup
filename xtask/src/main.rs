@@ -547,7 +547,72 @@ impl SettleContext {
     }
 }
 
-fn run_settle(guard: &mut SettleGuard) -> Result<()> {
+struct SettleAccounts {
+    seq_file: PathBuf,
+    seq_path: String,
+    seq_pubkey: Pubkey,
+    wallet_a_key: Keypair,
+    a_path: String,
+    a_pubkey: Pubkey,
+    wallet_b_key: Keypair,
+    b_path: String,
+    b_pubkey: Pubkey,
+    fresh_path: String,
+    fresh_pubkey: Pubkey,
+    program_id: Pubkey,
+}
+
+impl SettleAccounts {
+    fn create(dir: &Path) -> Result<Self> {
+        if dir.exists() {
+            fs::remove_dir_all(dir)?;
+        }
+        fs::create_dir_all(dir)?;
+
+        let make_key = |name: &str| -> Result<(Keypair, PathBuf, String)> {
+            let (kp, path) = (Keypair::new(), dir.join(format!("{name}.json")));
+            write_keypair_file(&kp, &path).map_err(|e| anyhow!("{e}"))?;
+            let s = pstr(&path)?.to_string();
+            Ok((kp, path, s))
+        };
+        let (sequencer_key, seq_file, seq_path) = make_key("sequencer")?;
+        let (wallet_a_key, _a_file, a_path) = make_key("wallet-a")?;
+        let (wallet_b_key, _b_file, b_path) = make_key("wallet-b")?;
+        let (fresh_key, _fresh_file, fresh_path) = make_key("fresh")?;
+        let (program_key, prog_file, _) = make_key("program")?;
+        drop(prog_file);
+
+        let seq_pubkey = sequencer_key.pubkey();
+        let a_pubkey = wallet_a_key.pubkey();
+        let b_pubkey = wallet_b_key.pubkey();
+        let fresh_pubkey = fresh_key.pubkey();
+        let program_id = program_key.pubkey();
+
+        Ok(Self {
+            seq_file,
+            seq_path,
+            seq_pubkey,
+            wallet_a_key,
+            a_path,
+            a_pubkey,
+            wallet_b_key,
+            b_path,
+            b_pubkey,
+            fresh_path,
+            fresh_pubkey,
+            program_id,
+        })
+    }
+}
+
+struct SettleScenario {
+    ctx: SettleContext,
+    accounts: SettleAccounts,
+    rent_min_0: u64,
+    seq_cluster_before: u64,
+}
+
+fn check_environment() -> Result<()> {
     ensure!(
         Command::new("solana-test-validator")
             .arg("--version")
@@ -571,7 +636,10 @@ fn run_settle(guard: &mut SettleGuard) -> Result<()> {
         "port 8080 is busy"
     );
     println!("ok: environment and tools checked");
+    Ok(())
+}
 
+fn build_settlement_and_workspace() -> Result<()> {
     let status = Command::new("cargo-build-sbf")
         .current_dir(workspace_root().join("programs/settlement"))
         .status()
@@ -579,33 +647,10 @@ fn run_settle(guard: &mut SettleGuard) -> Result<()> {
     ensure!(status.success(), "building settlement program failed");
     cargo(&["build", "--workspace", "--locked"])?;
     println!("ok: program and workspace built");
+    Ok(())
+}
 
-    if guard.dir.exists() {
-        fs::remove_dir_all(&guard.dir)?;
-    }
-    fs::create_dir_all(&guard.dir)?;
-
-    let make_key = |name: &str| -> Result<(Keypair, PathBuf, String)> {
-        let (kp, path) = (Keypair::new(), guard.dir.join(format!("{name}.json")));
-        write_keypair_file(&kp, &path).map_err(|e| anyhow!("{e}"))?;
-        let s = pstr(&path)?.to_string();
-        Ok((kp, path, s))
-    };
-    let (sequencer_key, seq_file, seq_path) = make_key("sequencer")?;
-    let (wallet_a_key, _a_file, a_path) = make_key("wallet-a")?;
-    let (wallet_b_key, _b_file, b_path) = make_key("wallet-b")?;
-    let (fresh_key, _fresh_file, fresh_path) = make_key("fresh")?;
-    let (program_key, prog_file, _) = make_key("program")?;
-    drop(prog_file);
-
-    let (seq_pubkey, a_pubkey, b_pubkey, fresh_pubkey, program_id) = (
-        sequencer_key.pubkey(),
-        wallet_a_key.pubkey(),
-        wallet_b_key.pubkey(),
-        fresh_key.pubkey(),
-        program_key.pubkey(),
-    );
-
+fn start_validator(guard: &mut SettleGuard, program_id: &Pubkey) -> Result<RpcClient> {
     let val_log = fs::File::create(guard.dir.join("validator.log"))?;
     let so_path = workspace_root().join("programs/settlement/target/deploy/settlement.so");
     let ledger_path = guard.dir.join("ledger");
@@ -648,36 +693,42 @@ fn run_settle(guard: &mut SettleGuard) -> Result<()> {
         "solana-test-validator failed to become ready in 90s"
     );
     println!("ok: validator started and ready");
+    Ok(rpc)
+}
 
-    let binaries = target_directory().join("debug");
-    let client_bin = binaries.join("rollup_client");
-    let http = Client::builder().timeout(Duration::from_secs(5)).build()?;
-    let ctx = SettleContext::new(rpc, http, program_id, client_bin);
-
-    for pk in [&seq_pubkey, &a_pubkey, &b_pubkey] {
-        ctx.airdrop(pk, 5_000_000_000)?;
+fn fund_and_deposit(s: &SettleScenario) -> Result<()> {
+    for pk in [
+        &s.accounts.seq_pubkey,
+        &s.accounts.a_pubkey,
+        &s.accounts.b_pubkey,
+    ] {
+        s.ctx.airdrop(pk, 5_000_000_000)?;
     }
 
-    let prog_str = program_id.to_string();
+    let prog_str = s.ctx.program_id.to_string();
     for (cmd, path, amt) in [
-        ("initialize", &seq_path, ""),
-        ("deposit", &a_path, "2000000000"),
-        ("deposit", &b_path, "1000000000"),
+        ("initialize", &s.accounts.seq_path, ""),
+        ("deposit", &s.accounts.a_path, "2000000000"),
+        ("deposit", &s.accounts.b_path, "1000000000"),
     ] {
         let mut args = vec![cmd, path.as_str(), &prog_str];
         if !amt.is_empty() {
             args.push(amt);
         }
         args.push("http://127.0.0.1:8899");
-        ctx.client(&args)?;
+        s.ctx.client(&args)?;
     }
     println!("ok: airdrops and initialization completed");
+    Ok(())
+}
 
+fn start_rollup(guard: &mut SettleGuard, s: &SettleScenario) -> Result<()> {
+    let binaries = target_directory().join("debug");
     let rollup_log = fs::File::create(guard.dir.join("rollup.log"))?;
     let rollup = Command::new(binaries.join("rollup_core"))
         .env("ROLLUP_CLUSTER_URL", "http://127.0.0.1:8899")
-        .env("ROLLUP_SETTLEMENT_PROGRAM", program_id.to_string())
-        .env("ROLLUP_SEQUENCER_KEYPAIR", &seq_file)
+        .env("ROLLUP_SETTLEMENT_PROGRAM", s.ctx.program_id.to_string())
+        .env("ROLLUP_SEQUENCER_KEYPAIR", &s.accounts.seq_file)
         .env("ROLLUP_BIND", "127.0.0.1:8080")
         .stdout(rollup_log.try_clone()?)
         .stderr(rollup_log)
@@ -692,7 +743,7 @@ fn run_settle(guard: &mut SettleGuard) -> Result<()> {
         if let Some(status) = roll.try_wait()? {
             bail!("rollup_core exited early with {status}");
         }
-        if let Ok(res) = ctx.http.get("http://127.0.0.1:8080/").send() {
+        if let Ok(res) = s.ctx.http.get("http://127.0.0.1:8080/").send() {
             if res.status().is_success() && res.json::<Value>()?["settlement"] == "configured" {
                 rollup_ready = true;
                 break;
@@ -702,53 +753,61 @@ fn run_settle(guard: &mut SettleGuard) -> Result<()> {
     }
     ensure!(rollup_ready, "rollup_core failed to become ready in 30s");
     println!("ok: rollup started in settlement mode");
+    Ok(())
+}
 
+fn verify_initial_balances(s: &SettleScenario) -> Result<()> {
     check_eq(
-        ctx.rollup_balance(&a_pubkey)?,
+        s.ctx.rollup_balance(&s.accounts.a_pubkey)?,
         Some(2_000_000_000),
         "initial rollup balance A",
     )?;
     check_eq(
-        ctx.rollup_balance(&b_pubkey)?,
+        s.ctx.rollup_balance(&s.accounts.b_pubkey)?,
         Some(1_000_000_000),
         "initial rollup balance B",
     )?;
 
-    let rent_min_0 = ctx.rpc.get_minimum_balance_for_rent_exemption(0)?;
     check_eq(
-        ctx.vault_balance()?,
-        rent_min_0 + 3_000_000_000,
+        s.ctx.vault_balance()?,
+        s.rent_min_0 + 3_000_000_000,
         "initial cluster vault balance",
     )?;
     check_eq(
-        ctx.total_committed()?,
+        s.ctx.total_committed()?,
         3_000_000_000,
         "initial total_committed",
     )?;
     println!("ok: initial balances verified");
+    Ok(())
+}
 
-    ctx.client(&[
-        &a_path,
-        &b_pubkey.to_string(),
+fn scenario_transfer(s: &SettleScenario) -> Result<()> {
+    s.ctx.client(&[
+        &s.accounts.a_path,
+        &s.accounts.b_pubkey.to_string(),
         "500000000",
         "http://127.0.0.1:8080",
     ])?;
     check_eq(
-        ctx.rollup_balance(&a_pubkey)?,
+        s.ctx.rollup_balance(&s.accounts.a_pubkey)?,
         Some(1_499_995_000),
         "balance A after transfer",
     )?;
     check_eq(
-        ctx.rollup_balance(&b_pubkey)?,
+        s.ctx.rollup_balance(&s.accounts.b_pubkey)?,
         Some(1_500_000_000),
         "balance B after transfer",
     )?;
     println!("ok: transfer A to B verified");
+    Ok(())
+}
 
-    ctx.client_refusal(
+fn scenario_refusals(s: &mut SettleScenario) -> Result<()> {
+    s.ctx.client_refusal(
         &[
-            &a_path,
-            &fresh_pubkey.to_string(),
+            &s.accounts.a_path,
+            &s.accounts.fresh_pubkey.to_string(),
             "100000000",
             "http://127.0.0.1:8080",
         ],
@@ -756,14 +815,14 @@ fn run_settle(guard: &mut SettleGuard) -> Result<()> {
         "fresh recipient",
     )?;
     check_eq(
-        ctx.rollup_balance(&a_pubkey)?,
+        s.ctx.rollup_balance(&s.accounts.a_pubkey)?,
         Some(1_499_995_000),
         "A balance unchanged after unfunded transfer refusal",
     )?;
-    ctx.client_refusal(
+    s.ctx.client_refusal(
         &[
-            &fresh_path,
-            &b_pubkey.to_string(),
+            &s.accounts.fresh_path,
+            &s.accounts.b_pubkey.to_string(),
             "100000000",
             "http://127.0.0.1:8080",
         ],
@@ -771,10 +830,10 @@ fn run_settle(guard: &mut SettleGuard) -> Result<()> {
         "uncommitted sender",
     )?;
 
-    let blockhash = ctx.blockhash()?;
-    let bad_sig = sign_leave(&wallet_a_key, &b_pubkey, &blockhash);
-    ctx.check_leave_status(
-        &b_pubkey,
+    let blockhash = s.ctx.blockhash()?;
+    let bad_sig = sign_leave(&s.accounts.wallet_a_key, &s.accounts.b_pubkey, &blockhash);
+    s.ctx.check_leave_status(
+        &s.accounts.b_pubkey,
         &blockhash,
         &bad_sig,
         400,
@@ -782,9 +841,9 @@ fn run_settle(guard: &mut SettleGuard) -> Result<()> {
     )?;
 
     let fake_bh = solana_hash::Hash::new_unique().to_string();
-    let fake_sig = sign_leave(&wallet_b_key, &b_pubkey, &fake_bh);
-    ctx.check_leave_status(
-        &b_pubkey,
+    let fake_sig = sign_leave(&s.accounts.wallet_b_key, &s.accounts.b_pubkey, &fake_bh);
+    s.ctx.check_leave_status(
+        &s.accounts.b_pubkey,
         &fake_bh,
         &fake_sig,
         400,
@@ -792,19 +851,25 @@ fn run_settle(guard: &mut SettleGuard) -> Result<()> {
     )?;
     println!("ok: refusals verified");
 
-    let seq_cluster_before = ctx.rpc.get_balance(&seq_pubkey)?;
-    let vault_bal_before = ctx.vault_balance()?;
-    let committed_before = ctx.total_committed()?;
+    s.seq_cluster_before = s.ctx.rpc.get_balance(&s.accounts.seq_pubkey)?;
+    let vault_bal_before = s.ctx.vault_balance()?;
+    let committed_before = s.ctx.total_committed()?;
 
-    let latest_bh = ctx.rpc.get_latest_blockhash()?;
-    let fake_leave_ix = settlement_client::leave_instruction(&program_id, &a_pubkey, &a_pubkey, 0);
+    let latest_bh = s.ctx.rpc.get_latest_blockhash()?;
+    let fake_leave_ix = settlement_client::leave_instruction(
+        &s.ctx.program_id,
+        &s.accounts.a_pubkey,
+        &s.accounts.a_pubkey,
+        0,
+    );
     let fake_leave_tx = Transaction::new_signed_with_payer(
         &[fake_leave_ix],
-        Some(&a_pubkey),
-        &[&wallet_a_key],
+        Some(&s.accounts.a_pubkey),
+        &[&s.accounts.wallet_a_key],
         latest_bh,
     );
-    let err = ctx
+    let err = s
+        .ctx
         .rpc
         .send_and_confirm_transaction(&fake_leave_tx)
         .err()
@@ -814,30 +879,36 @@ fn run_settle(guard: &mut SettleGuard) -> Result<()> {
         err_str.contains("custom program error: 0x6"),
         "unexpected error for NotSequencer: {err_str}"
     );
-    ctx.check_vault_and_committed(vault_bal_before, committed_before, "NotSequencer")?;
+    s.ctx
+        .check_vault_and_committed(vault_bal_before, committed_before, "NotSequencer")?;
     println!("ok: leave not from the sequencer refused (NotSequencer)");
 
-    ctx.client_refusal(
+    s.ctx.client_refusal(
         &[
             "deposit",
-            &a_path,
-            &prog_str,
+            &s.accounts.a_path,
+            &s.ctx.program_id.to_string(),
             "1000",
             "http://127.0.0.1:8899",
         ],
         "0x5",
         "second deposit",
     )?;
-    ctx.check_vault_and_committed(vault_bal_before, committed_before, "AlreadyDeposited")?;
+    s.ctx
+        .check_vault_and_committed(vault_bal_before, committed_before, "AlreadyDeposited")?;
     println!("ok: second deposit refused (AlreadyDeposited)");
+    Ok(())
+}
 
-    ctx.check_ledger_rent(&b_pubkey, "ledger B balance before leave")?;
-    let b_cluster_before = ctx.rpc.get_balance(&b_pubkey)?;
-    let vault_before_b = ctx.vault_balance()?;
+fn scenario_leave_b(s: &SettleScenario) -> Result<()> {
+    s.ctx
+        .check_ledger_rent(&s.accounts.b_pubkey, "ledger B balance before leave")?;
+    let b_cluster_before = s.ctx.rpc.get_balance(&s.accounts.b_pubkey)?;
+    let vault_before_b = s.ctx.vault_balance()?;
 
-    let bh_b = ctx.blockhash()?;
-    let sig_b = sign_leave(&wallet_b_key, &b_pubkey, &bh_b);
-    let res = ctx.post_leave(&b_pubkey, &bh_b, &sig_b)?;
+    let bh_b = s.ctx.blockhash()?;
+    let sig_b = sign_leave(&s.accounts.wallet_b_key, &s.accounts.b_pubkey, &bh_b);
+    let res = s.ctx.post_leave(&s.accounts.b_pubkey, &bh_b, &sig_b)?;
     check_eq(res.status().as_u16(), 200, "leave B status")?;
     let receipt_b: Value = res.json()?;
     check_eq(
@@ -846,29 +917,42 @@ fn run_settle(guard: &mut SettleGuard) -> Result<()> {
         "leave B lamports",
     )?;
 
-    ctx.check_wallet_left(&b_pubkey, b_cluster_before, 1_500_000_000, "B")?;
+    s.ctx
+        .check_wallet_left(&s.accounts.b_pubkey, b_cluster_before, 1_500_000_000, "B")?;
     check_eq(
-        ctx.vault_balance()?,
+        s.ctx.vault_balance()?,
         vault_before_b - 1_500_000_000,
         "vault balance after B leave",
     )?;
 
-    let bh2 = ctx.blockhash()?;
-    let sig2 = sign_leave(&wallet_b_key, &b_pubkey, &bh2);
-    ctx.check_leave_status(&b_pubkey, &bh2, &sig2, 404, "second leave B must be 404")?;
-    ctx.check_leave_status(
-        &b_pubkey,
+    let bh2 = s.ctx.blockhash()?;
+    let sig2 = sign_leave(&s.accounts.wallet_b_key, &s.accounts.b_pubkey, &bh2);
+    s.ctx.check_leave_status(
+        &s.accounts.b_pubkey,
+        &bh2,
+        &sig2,
+        404,
+        "second leave B must be 404",
+    )?;
+    s.ctx.check_leave_status(
+        &s.accounts.b_pubkey,
         &bh_b,
         &sig_b,
         409,
         "replaying leave B must be 409",
     )?;
     println!("ok: wallet B leave verified");
+    Ok(())
+}
 
-    ctx.check_ledger_rent(&a_pubkey, "ledger A balance before leave")?;
-    let a_cluster_before = ctx.rpc.get_balance(&a_pubkey)?;
+fn scenario_leave_a(s: &SettleScenario) -> Result<()> {
+    s.ctx
+        .check_ledger_rent(&s.accounts.a_pubkey, "ledger A balance before leave")?;
+    let a_cluster_before = s.ctx.rpc.get_balance(&s.accounts.a_pubkey)?;
 
-    let out = ctx.client(&["leave", &a_path, "http://127.0.0.1:8080"])?;
+    let out = s
+        .ctx
+        .client(&["leave", &s.accounts.a_path, "http://127.0.0.1:8080"])?;
     let receipt_a: Value = serde_json::from_str(&out)?;
     check_eq(
         receipt_a["lamports"].as_u64(),
@@ -876,24 +960,54 @@ fn run_settle(guard: &mut SettleGuard) -> Result<()> {
         "leave A lamports",
     )?;
 
-    ctx.check_wallet_left(&a_pubkey, a_cluster_before, 1_499_995_000, "A")?;
+    s.ctx
+        .check_wallet_left(&s.accounts.a_pubkey, a_cluster_before, 1_499_995_000, "A")?;
 
     check_eq(
-        ctx.vault_balance()?,
-        rent_min_0 + 5_000,
+        s.ctx.vault_balance()?,
+        s.rent_min_0 + 5_000,
         "vault balance after A leave",
     )?;
     check_eq(
-        ctx.total_committed()?,
+        s.ctx.total_committed()?,
         5_000,
         "total_committed after A leave",
     )?;
     check_eq(
-        ctx.rpc.get_balance(&seq_pubkey)?,
-        seq_cluster_before - 10_000,
+        s.ctx.rpc.get_balance(&s.accounts.seq_pubkey)?,
+        s.seq_cluster_before - 10_000,
         "sequencer cluster balance dropped by 2 cluster fees",
     )?;
     println!("ok: wallet A leave verified");
+    Ok(())
+}
+
+fn run_settle(guard: &mut SettleGuard) -> Result<()> {
+    check_environment()?;
+    build_settlement_and_workspace()?;
+
+    let accounts = SettleAccounts::create(&guard.dir)?;
+    let rpc = start_validator(guard, &accounts.program_id)?;
+
+    let http = Client::builder().timeout(Duration::from_secs(5)).build()?;
+    let client_bin = target_directory().join("debug/rollup_client");
+    let ctx = SettleContext::new(rpc, http, accounts.program_id, client_bin);
+    let rent_min_0 = ctx.rpc.get_minimum_balance_for_rent_exemption(0)?;
+
+    let mut scenario = SettleScenario {
+        ctx,
+        accounts,
+        rent_min_0,
+        seq_cluster_before: 0,
+    };
+
+    fund_and_deposit(&scenario)?;
+    start_rollup(guard, &scenario)?;
+    verify_initial_balances(&scenario)?;
+    scenario_transfer(&scenario)?;
+    scenario_refusals(&mut scenario)?;
+    scenario_leave_b(&scenario)?;
+    scenario_leave_a(&scenario)?;
 
     Ok(())
 }
